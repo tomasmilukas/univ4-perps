@@ -11,6 +11,10 @@ import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {AggregatorV3Interface} from "chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
+import {TickMath} from "v4-core/libraries/TickMath.sol";
+import {SqrtPriceMath} from "v4-core/libraries/SqrtPriceMath.sol";
+import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "v4-core/types/BalanceDelta.sol";
+
 import "solidity-stringutils/src/strings.sol";
 
 contract PerpDexHook is BaseHook {
@@ -18,6 +22,7 @@ contract PerpDexHook is BaseHook {
     using StateLibrary for IPoolManager;
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
+    using BalanceDeltaLibrary for BalanceDelta;
 
     uint256 public constant MAX_LEVERAGE = 5;
     uint256 public constant LIQUIDATION_THRESHOLD = 80; // 80%
@@ -39,6 +44,8 @@ contract PerpDexHook is BaseHook {
     }
 
     struct Collateral {
+        uint256 fundedAmountCurrency0;
+        uint256 fundedAmountCurrency1;
         uint256 currency0Amount;
         uint256 currency1Amount;
     }
@@ -47,12 +54,18 @@ contract PerpDexHook is BaseHook {
     mapping(address => Position) public livePositions;
     mapping(address => Collateral) public traderCollateral;
 
-    uint256 public totalLiquidity;
+    // Underlying reserves in Univ4 pool to calculate total liquidity (USD denominated) for providing collateral
+    uint256 public underlyingLiquidityAmountCurrency0;
+    uint256 public underlyingLiquidityAmountCurrency1;
 
-    // Locked currencies for traders realise profits.
-    uint256 public traderPayOutLockedCurrency0;
-    uint256 public traderPayOutLockedCurrency1;
+    // Locked collateral in underlying pool for leveraged traders
+    uint256 public lockedUSDForCollateral;
 
+    // Locked currencies for traders realise profits. Trader realise profits in pools currency, not USD.
+    uint256 public traderPayOutRealisedCurrency0;
+    uint256 public traderPayOutRealisedCurrency1;
+
+    // OI recorded in USD
     uint256 public longOpenInterest;
     uint256 public shortOpenInterest;
 
@@ -96,13 +109,13 @@ contract PerpDexHook is BaseHook {
         return
             Hooks.Permissions({
                 beforeInitialize: true,
-                afterInitialize: true,
-                beforeAddLiquidity: true,
+                afterInitialize: false,
+                beforeAddLiquidity: false,
                 afterAddLiquidity: true,
-                beforeRemoveLiquidity: true,
+                beforeRemoveLiquidity: false,
                 afterRemoveLiquidity: true,
                 beforeSwap: false,
-                afterSwap: false,
+                afterSwap: true,
                 beforeDonate: false,
                 afterDonate: false,
                 beforeSwapReturnDelta: false,
@@ -118,7 +131,6 @@ contract PerpDexHook is BaseHook {
         PoolKey calldata key,
         uint160 sqrtPriceX96
     ) external override returns (bytes4) {
-        totalLiquidity = 0;
         longOpenInterest = 0;
         shortOpenInterest = 0;
         fundingFeesCurrency0 = 0;
@@ -141,35 +153,31 @@ contract PerpDexHook is BaseHook {
         return this.beforeInitialize.selector;
     }
 
-    function beforeAddLiquidity(
+    function afterAddLiquidity(
         address sender,
         PoolKey calldata key,
         IPoolManager.ModifyLiquidityParams calldata params,
+        BalanceDelta delta,
+        BalanceDelta feesAccrued,
         bytes calldata
-    ) external override returns (bytes4) {
-        if (params.liquidityDelta > 0) {
-            totalLiquidity += uint256(params.liquidityDelta);
+    ) external override returns (bytes4, BalanceDelta) {
+        if (params.liquidityDelta <= 0) {
+            return (this.afterAddLiquidity.selector, toBalanceDelta(0, 0));
         }
 
-        return this.beforeAddLiquidity.selector;
-    }
+        int128 amount0 = delta.amount0();
+        int128 amount1 = delta.amount1();
 
-    function beforeRemoveLiquidity(
-        address sender,
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata
-    ) external override returns (bytes4) {
-        // require(
-        //     totalLiquidity - uint256(-params.liquidityDelta) >= lockedLiquidity,
-        //     "Cannot remove locked liquidity"
-        // );
+        underlyingLiquidityAmountCurrency0 += uint128(amount0);
+        underlyingLiquidityAmountCurrency1 += uint128(amount1);
 
-        if (params.liquidityDelta > 0) {
-            totalLiquidity -= uint256(params.liquidityDelta);
-        }
+        int128 buffer0 = (amount0 * 10) / 100;
+        int128 buffer1 = (amount1 * 10) / 100;
 
-        return this.beforeRemoveLiquidity.selector;
+        return (
+            this.afterAddLiquidity.selector,
+            toBalanceDelta(buffer0, buffer1)
+        );
     }
 
     function afterRemoveLiquidity(
@@ -180,54 +188,140 @@ contract PerpDexHook is BaseHook {
         BalanceDelta delta2,
         bytes calldata
     ) external override returns (bytes4, BalanceDelta) {
-        uint256 lpersLiquidity = uint256(params.liquidityDelta);
-
         return (this.afterRemoveLiquidity.selector, delta1);
     }
 
+    function afterSwap(
+        address sender,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        BalanceDelta delta,
+        bytes calldata hookData
+    ) external override returns (bytes4, int128) {
+        // Update our tracked reserves based on swap delta
+        if (delta.amount0() > 0) {
+            underlyingLiquidityAmountCurrency0 += uint128(delta.amount0());
+        } else {
+            underlyingLiquidityAmountCurrency0 -= uint128(-delta.amount0());
+        }
+
+        if (delta.amount1() > 0) {
+            underlyingLiquidityAmountCurrency1 += uint128(delta.amount1());
+        } else {
+            underlyingLiquidityAmountCurrency1 -= uint128(-delta.amount1());
+        }
+
+        return (this.afterRemoveLiquidity.selector, 0);
+    }
+
     function addCollateral(
-        address trader,
-        uint256 currency0,
-        uint256 currency1
+        uint256 currency0Amount,
+        uint256 currency1Amount
     ) external payable {
-        if (currency0 > 0) {
+        if (currency0Amount > 0) {
             require(
                 IERC20Metadata(currency0Address).transferFrom(
                     msg.sender,
                     address(this),
-                    currency0
+                    uint256(currency0Amount)
                 ),
                 "Transfer failed"
             );
-            traderCollateral[trader].currency0Amount += currency0;
+            traderCollateral[msg.sender].currency0Amount += currency0Amount;
+            traderCollateral[msg.sender]
+                .fundedAmountCurrency0 += currency0Amount;
         }
 
-        if (currency1 > 0) {
+        if (currency1Amount > 0) {
             require(
                 IERC20Metadata(currency1Address).transferFrom(
                     msg.sender,
                     address(this),
-                    currency1
+                    uint256(currency1Amount)
                 ),
                 "Transfer failed"
             );
-            traderCollateral[trader].currency1Amount += currency1;
+            traderCollateral[msg.sender].currency1Amount += currency1Amount;
+            traderCollateral[msg.sender]
+                .fundedAmountCurrency1 += currency1Amount;
         }
     }
 
     function removeCollateral() external {
-        // if (USDC.balanceOf(address(this)) > traderCollateral[msg.sender]) {
-        //     require(
-        //         USDC.transferFrom(
-        //             address(this),
-        //             msg.sender,
-        //             traderCollateral[msg.sender]
-        //         ),
-        //         "USDC transfer failed"
-        //     );
-        // } else {
-        //     // trigger the process for removing from funding fees + buffer capital + LP funds
-        // }
+        // payout capital available to trader
+        uint256 totalPayoutCapitalCurrency0 = bufferCapitalCurrency0 +
+            traderPnLFeesCurrency0 +
+            leverageFeesCurrency0;
+
+        require(
+            traderCollateral[msg.sender].currency0Amount >
+                totalPayoutCapitalCurrency0,
+            "Not enough capital in pool to pay out. Wait for fee accrual"
+        );
+
+        uint256 traderProfit0 = traderCollateral[msg.sender].currency0Amount -
+            traderCollateral[msg.sender].fundedAmountCurrency0;
+
+        if (traderProfit0 > 0) {
+            if (traderProfit0 - bufferCapitalCurrency0 > 0) {
+                bufferCapitalCurrency0 = 0;
+                traderProfit0 -= bufferCapitalCurrency0;
+            }
+
+            if (traderProfit0 - traderPnLFeesCurrency0 > 0) {
+                traderPnLFeesCurrency0 = 0;
+                traderProfit0 -= traderPnLFeesCurrency0;
+            }
+
+            if (traderProfit0 - leverageFeesCurrency0 > 0) {
+                leverageFeesCurrency0 = 0;
+                traderProfit0 -= leverageFeesCurrency0;
+            }
+        }
+
+        IERC20Metadata(currency0Address).transferFrom(
+            address(this),
+            msg.sender,
+            uint256(traderCollateral[msg.sender].currency0Amount)
+        );
+
+        // Handle currency 1
+
+        uint256 totalPayoutCapitalCurrency1 = bufferCapitalCurrency1 +
+            traderPnLFeesCurrency1 +
+            leverageFeesCurrency1;
+
+        require(
+            traderCollateral[msg.sender].currency1Amount >
+                totalPayoutCapitalCurrency1,
+            "Not enough capital in pool to pay out. Wait for fee accrual"
+        );
+
+        uint256 traderProfit1 = traderCollateral[msg.sender].currency1Amount -
+            traderCollateral[msg.sender].fundedAmountCurrency1;
+
+        if (traderProfit1 > 0) {
+            if (traderProfit1 - bufferCapitalCurrency1 > 0) {
+                bufferCapitalCurrency1 = 0;
+                traderProfit1 -= bufferCapitalCurrency1;
+            }
+
+            if (traderProfit1 - traderPnLFeesCurrency1 > 0) {
+                traderPnLFeesCurrency1 = 0;
+                traderProfit1 -= traderPnLFeesCurrency1;
+            }
+
+            if (traderProfit1 - leverageFeesCurrency1 > 0) {
+                leverageFeesCurrency1 = 0;
+                traderProfit1 -= leverageFeesCurrency1;
+            }
+        }
+
+        IERC20Metadata(currency1Address).transferFrom(
+            address(this),
+            msg.sender,
+            uint256(traderCollateral[msg.sender].currency1Amount)
+        );
 
         delete traderCollateral[msg.sender];
     }
@@ -242,11 +336,6 @@ contract PerpDexHook is BaseHook {
         bool isLong
     ) external {
         require(leverage <= MAX_LEVERAGE, "Leverage too high");
-        // FIX THIS ONE BELOW. TOTAL LIQUIDITY SHOULD BE THE RESERVERS OF TOKEN 0 AND TOKEN 1. LONG AND OPEN INTEREST ARE ALSO MORE FLUCTUATING DEPENDING ON PNL OR JUST MARGIN?
-        require(
-            shortOpenInterest + longOpenInterest >= 2 * totalLiquidity,
-            "The size of open interest on this pool has been reached"
-        );
         require(
             livePositions[msg.sender].trader == address(0),
             "A position already exists for this trader"
@@ -276,6 +365,13 @@ contract PerpDexHook is BaseHook {
 
         // USD denominated position size
         uint256 positionSize = currencyPrice * marginAmount * leverage;
+
+        (, , uint256 totalPoolValueUSD) = getUnderlyingPoolTokenValuesUSD(key);
+
+        require(
+            lockedUSDForCollateral + positionSize >= totalPoolValueUSD,
+            "Liquidity capacity has been reached. Can't open new positions."
+        );
 
         // Update position tracking
         livePositions[msg.sender] = Position({
@@ -347,7 +443,7 @@ contract PerpDexHook is BaseHook {
             if (marginCurrencyIs0) {
                 uint256 currency0ToPayOut = profit / currency0Price;
 
-                traderPayOutLockedCurrency0 += currency0ToPayOut;
+                traderPayOutRealisedCurrency0 += currency0ToPayOut;
 
                 traderCollateral[msg.sender].currency0Amount +=
                     position.marginAmount +
@@ -355,7 +451,7 @@ contract PerpDexHook is BaseHook {
             } else {
                 uint256 currency1ToPayOut = profit / currency1Price;
 
-                traderPayOutLockedCurrency1 += currency1ToPayOut;
+                traderPayOutRealisedCurrency1 += currency1ToPayOut;
 
                 traderCollateral[msg.sender].currency1Amount +=
                     position.marginAmount +
@@ -423,6 +519,24 @@ contract PerpDexHook is BaseHook {
         // TODO: Implementation
     }
 
+    function getUnderlyingPoolTokenValuesUSD(
+        PoolKey calldata key
+    ) public view returns (uint256, uint256, uint256) {
+        uint256 currency0Price = getCurrentPrice(key, currency0Address);
+        uint256 currency1Price = getCurrentPrice(key, currency1Address);
+
+        uint256 currency0Value = currency0Price *
+            underlyingLiquidityAmountCurrency0;
+        uint256 currency1Value = currency1Price *
+            underlyingLiquidityAmountCurrency1;
+
+        return (
+            currency0Value,
+            currency1Value,
+            currency0Value + currency1Value // total pool value in USD at this moment
+        );
+    }
+
     function getCurrentPrice(
         PoolKey calldata key,
         address currencyAddress
@@ -438,8 +552,7 @@ contract PerpDexHook is BaseHook {
         }
 
         (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
-        uint256 poolPrice = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >>
-            192;
+        uint256 poolPrice = (uint160(sqrtPriceX96) * uint160(sqrtPriceX96)) >> 192;
 
         if (isBaseCurrency0) {
             // Chainlink base is currency0 (ETH)
@@ -461,22 +574,18 @@ contract PerpDexHook is BaseHook {
     }
 
     function getLeverageRate(
-        address traderAddress
+        address traderAddress,
+        uint256 utilizationRate
     ) public view returns (uint256) {
         return
             (BASE_LEVERAGE_RATE *
                 livePositions[traderAddress].leverage *
-                (getUtilizationRate() * 10)) / 1e4;
-    }
-
-    // FIX THIS WITH USD AND STUFF. USED UP RESERVERS DIVIDED BY TOTAL RESERVES.
-    function getUtilizationRate() public view returns (uint256) {
-        return (0 * 1e4) / totalLiquidity;
+                (utilizationRate * 10)) / 1e4;
     }
 
     function getImbalanceRate() public view returns (uint256) {
         return
-            (longOpenInterest - shortOpenInterest) /
+            (100 * (longOpenInterest - shortOpenInterest)) /
             (longOpenInterest + shortOpenInterest);
     }
 
