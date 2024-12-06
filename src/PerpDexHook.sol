@@ -17,6 +17,9 @@ import {BalanceDelta, BalanceDeltaLibrary, toBalanceDelta} from "v4-core/types/B
 
 import "solidity-stringutils/src/strings.sol";
 
+// REMOVE BEFORE SUBMISSION
+import "forge-std/console.sol";
+
 contract PerpDexHook is BaseHook {
     using strings for *;
     using StateLibrary for IPoolManager;
@@ -71,12 +74,9 @@ contract PerpDexHook is BaseHook {
         // Fees for LPs from traders losing money
         uint256 traderPnLFeesCurrency0;
         uint256 traderPnLFeesCurrency1;
-        // Fees for opening positions
-        uint256 openingFeesCurrency0;
-        uint256 openingFeesCurrency1;
-        // Fees for closing positions
-        uint256 closingFeesCurrency0;
-        uint256 closingFeesCurrency1;
+        // Fees for opening and closing positions
+        uint256 tradingFeesCurrency0;
+        uint256 tradingFeesCurrency1;
     }
 
     // keeping track of traders
@@ -112,7 +112,6 @@ contract PerpDexHook is BaseHook {
 
     // Chainlink specifics
     AggregatorV3Interface public priceFeed;
-    uint8 private priceDecimals;
     bool public isBaseCurrency0;
 
     constructor(
@@ -122,7 +121,6 @@ contract PerpDexHook is BaseHook {
         address _operator
     ) BaseHook(_poolManager) {
         priceFeed = AggregatorV3Interface(_priceFeedAddress);
-        priceDecimals = priceFeed.decimals();
         isBaseCurrency0 = _isBaseCurrency0;
         operator = _operator;
 
@@ -131,10 +129,8 @@ contract PerpDexHook is BaseHook {
             leverageFeesCurrency1: 0,
             traderPnLFeesCurrency0: 0,
             traderPnLFeesCurrency1: 0,
-            openingFeesCurrency0: 0,
-            openingFeesCurrency1: 0,
-            closingFeesCurrency0: 0,
-            closingFeesCurrency1: 0
+            tradingFeesCurrency0: 0,
+            tradingFeesCurrency1: 0
         });
     }
 
@@ -177,10 +173,10 @@ contract PerpDexHook is BaseHook {
             ? currency0Address
             : currency1Address;
 
-        require(
-            validateFeed(expectedCurrency),
-            "Price feed mismatch with token"
-        );
+        // require(
+        //     validateFeed(expectedCurrency),
+        //     "Price feed mismatch with token"
+        // );
 
         // Initialize pool parameters
         return this.beforeInitialize.selector;
@@ -212,6 +208,9 @@ contract PerpDexHook is BaseHook {
 
         underlyingLiquidityAmountCurrency0 += uint128(amount0 - buffer0);
         underlyingLiquidityAmountCurrency1 += uint128(amount1 - buffer1);
+
+        bufferCapitalCurrency0 += uint256(uint128(buffer0));
+        bufferCapitalCurrency1 += uint256(uint128(buffer1));
 
         return (
             this.afterAddLiquidity.selector,
@@ -250,58 +249,51 @@ contract PerpDexHook is BaseHook {
         FeeShare memory share = shares[sender];
         LPFees storage fees = lpFees;
 
-        uint256 ratio0 = (share.token0Deposited * 1e18) /
-            totalCurrency0Deposited;
-        uint256 ratio1 = (share.token1Deposited * 1e18) /
-            totalCurrency1Deposited;
-
-        uint256 bufferShare0 = (bufferCapitalCurrency0 * ratio0) / 1e18;
-        uint256 bufferShare1 = (bufferCapitalCurrency1 * ratio1) / 1e18;
-
-        uint256 leverageFees0 = (fees.leverageFeesCurrency0 * ratio0) / 1e18;
-        uint256 leverageFees1 = (fees.leverageFeesCurrency1 * ratio1) / 1e18;
-
-        uint256 traderPnLFees0 = (fees.traderPnLFeesCurrency0 * ratio0) / 1e18;
-        uint256 traderPnLFees1 = (fees.traderPnLFeesCurrency1 * ratio1) / 1e18;
-
-        uint256 openingFees0 = (fees.openingFeesCurrency0 * ratio0) / 1e18;
-        uint256 openingFees1 = (fees.openingFeesCurrency1 * ratio1) / 1e18;
-
-        uint256 closingFees0 = (fees.closingFeesCurrency0 * ratio0) / 1e18;
-        uint256 closingFees1 = (fees.closingFeesCurrency1 * ratio1) / 1e18;
-
-        uint256 totalPayout0 = bufferShare0 +
-            leverageFees0 +
-            traderPnLFees0 +
-            openingFees0 +
-            closingFees0;
-
-        uint256 totalPayout1 = bufferShare1 +
-            leverageFees1 +
-            traderPnLFees1 +
-            openingFees1 +
-            closingFees1;
+        uint256 totalFees0 = fees.leverageFeesCurrency0 +
+            fees.traderPnLFeesCurrency0 +
+            fees.tradingFeesCurrency0;
+        uint256 totalFees1 = fees.leverageFeesCurrency1 +
+            fees.traderPnLFeesCurrency1 +
+            fees.tradingFeesCurrency1;
 
         IERC20Metadata(currency0Address).transferFrom(
             msg.sender,
             sender,
-            totalPayout0
+            ((bufferCapitalCurrency0 + totalFees0) * share.token0Deposited) /
+                totalCurrency0Deposited
         );
-
         IERC20Metadata(currency1Address).transferFrom(
             msg.sender,
             sender,
-            totalPayout1
+            ((bufferCapitalCurrency1 + totalFees1) * share.token1Deposited) /
+                totalCurrency1Deposited
         );
 
-        fees.leverageFeesCurrency0 -= leverageFees0;
-        fees.leverageFeesCurrency1 -= leverageFees1;
-        fees.traderPnLFeesCurrency0 -= traderPnLFees0;
-        fees.traderPnLFeesCurrency1 -= traderPnLFees1;
-        fees.closingFeesCurrency0 -= openingFees0;
-        fees.closingFeesCurrency1 -= openingFees1;
-        fees.openingFeesCurrency0 -= closingFees0;
-        fees.openingFeesCurrency1 -= closingFees1;
+        // Update fees with inline calculations
+        fees.leverageFeesCurrency0 =
+            fees.leverageFeesCurrency0 -
+            ((fees.leverageFeesCurrency0 * share.token0Deposited) /
+                totalCurrency0Deposited);
+        fees.leverageFeesCurrency1 =
+            fees.leverageFeesCurrency1 -
+            ((fees.leverageFeesCurrency1 * share.token1Deposited) /
+                totalCurrency1Deposited);
+        fees.traderPnLFeesCurrency0 =
+            fees.traderPnLFeesCurrency0 -
+            ((fees.traderPnLFeesCurrency0 * share.token0Deposited) /
+                totalCurrency0Deposited);
+        fees.traderPnLFeesCurrency1 =
+            fees.traderPnLFeesCurrency1 -
+            ((fees.traderPnLFeesCurrency1 * share.token1Deposited) /
+                totalCurrency1Deposited);
+        fees.tradingFeesCurrency0 =
+            fees.tradingFeesCurrency0 -
+            ((fees.tradingFeesCurrency0 * share.token0Deposited) /
+                totalCurrency0Deposited);
+        fees.tradingFeesCurrency1 =
+            fees.tradingFeesCurrency1 -
+            ((fees.tradingFeesCurrency1 * share.token1Deposited) /
+                totalCurrency1Deposited);
 
         delete shares[sender];
 
@@ -371,8 +363,7 @@ contract PerpDexHook is BaseHook {
         uint256 totalPayoutCapitalCurrency0 = bufferCapitalCurrency0 +
             fees.traderPnLFeesCurrency0 +
             fees.leverageFeesCurrency0 +
-            fees.closingFeesCurrency0 +
-            fees.openingFeesCurrency0;
+            fees.tradingFeesCurrency0;
 
         require(
             traderCollateral[msg.sender].currency0Amount >
@@ -399,14 +390,9 @@ contract PerpDexHook is BaseHook {
                 traderProfit0 -= fees.leverageFeesCurrency0;
             }
 
-            if (traderProfit0 - fees.openingFeesCurrency0 > 0) {
-                fees.openingFeesCurrency0 = 0;
-                traderProfit0 -= fees.openingFeesCurrency0;
-            }
-
-            if (traderProfit0 - fees.closingFeesCurrency0 > 0) {
-                fees.closingFeesCurrency0 = 0;
-                traderProfit0 -= fees.closingFeesCurrency0;
+            if (traderProfit0 - fees.tradingFeesCurrency0 > 0) {
+                fees.tradingFeesCurrency0 = 0;
+                traderProfit0 -= fees.tradingFeesCurrency0;
             }
         }
 
@@ -421,8 +407,7 @@ contract PerpDexHook is BaseHook {
         uint256 totalPayoutCapitalCurrency1 = bufferCapitalCurrency1 +
             fees.traderPnLFeesCurrency1 +
             fees.leverageFeesCurrency1 +
-            fees.closingFeesCurrency1 +
-            fees.openingFeesCurrency1;
+            fees.tradingFeesCurrency1;
 
         require(
             traderCollateral[msg.sender].currency1Amount >
@@ -449,14 +434,9 @@ contract PerpDexHook is BaseHook {
                 traderProfit1 -= fees.leverageFeesCurrency1;
             }
 
-            if (traderProfit1 - fees.openingFeesCurrency1 > 0) {
-                fees.openingFeesCurrency1 = 0;
-                traderProfit1 -= fees.openingFeesCurrency1;
-            }
-
-            if (traderProfit1 - fees.closingFeesCurrency1 > 0) {
-                fees.closingFeesCurrency1 = 0;
-                traderProfit1 -= fees.closingFeesCurrency1;
+            if (traderProfit1 - fees.tradingFeesCurrency1 > 0) {
+                fees.tradingFeesCurrency1 = 0;
+                traderProfit1 -= fees.tradingFeesCurrency1;
             }
         }
 
@@ -469,6 +449,7 @@ contract PerpDexHook is BaseHook {
         delete traderCollateral[msg.sender];
     }
 
+    // ADD FEES FOR OPEN AND CLOSE POSITION. 0.05% or smthg
     // Trading functions
     function openPosition(
         PoolKey calldata key,
@@ -482,6 +463,19 @@ contract PerpDexHook is BaseHook {
         require(
             livePositions[msg.sender].trader == address(0),
             "A position already exists for this trader"
+        );
+        console.log(
+            traderCollateral[msg.sender].currency1Amount,
+            traderCollateral[msg.sender].currency0Amount
+        );
+
+        require(
+            (marginCurrency == currency0Address &&
+                traderCollateral[msg.sender].currency0Amount >= marginAmount) ||
+                (marginCurrency == currency1Address &&
+                    traderCollateral[msg.sender].currency1Amount >=
+                    marginAmount),
+            "Must fund collateral to open position"
         );
 
         require(
@@ -504,10 +498,19 @@ contract PerpDexHook is BaseHook {
             "Insufficient currency0 or curency1 trader collateral"
         );
 
+        console.log("PASS HERE 1");
+
         uint256 currencyPrice = getCurrentPrice(key, marginCurrency);
 
         // USD denominated position size
         uint256 positionSize = currencyPrice * marginAmount * leverage;
+
+        console.log("PASS HERE", currencyPrice, positionSize);
+        console.log(
+            "PASS HERE 123",
+            underlyingLiquidityAmountCurrency0,
+            underlyingLiquidityAmountCurrency1
+        );
 
         (, , uint256 totalPoolValueUSD) = getUnderlyingPoolTokenValuesUSD(
             key,
@@ -515,8 +518,15 @@ contract PerpDexHook is BaseHook {
             underlyingLiquidityAmountCurrency1
         );
 
+        console.log(
+            "PASS HERE 2",
+            lockedUSDForCollateral,
+            positionSize,
+            totalPoolValueUSD
+        );
+
         require(
-            lockedUSDForCollateral + positionSize >= totalPoolValueUSD,
+            lockedUSDForCollateral + positionSize < totalPoolValueUSD,
             "Liquidity capacity has been reached. Can't open new positions."
         );
 
@@ -539,11 +549,15 @@ contract PerpDexHook is BaseHook {
             shortOpenInterest += positionSize;
         }
 
+        console.log("PASS HERE 3");
+
         if (marginCurrency == currency0Address) {
             traderCollateral[msg.sender].currency0Amount -= marginAmount;
         } else {
             traderCollateral[msg.sender].currency1Amount -= marginAmount;
         }
+
+        lockedUSDForCollateral += positionSize;
 
         emit PositionOpened(
             msg.sender,
@@ -562,17 +576,19 @@ contract PerpDexHook is BaseHook {
         PoolKey calldata key
     ) external {
         LPFees storage fees = lpFees;
+        console.log("enter closePosition");
 
         Position memory position = livePositions[traderAddress];
-        uint256 currency0Price = getCurrentPrice(key, currency0Address);
-        uint256 currency1Price = getCurrentPrice(key, currency1Address);
+        int256 currency0Price = int256(getCurrentPrice(key, currency0Address));
+        int256 currency1Price = int256(getCurrentPrice(key, currency1Address));
+        console.log("out of pricing");
 
-        uint256 entryPrice = position.entryPriceUSD;
-        uint256 exitPrice = position.currencyBettingOn == currency0Address
+        int256 entryPrice = int256(position.entryPriceUSD);
+        int256 exitPrice = position.currencyBettingOn == currency0Address
             ? currency0Price
             : currency1Price;
 
-        uint256 profit;
+        int256 profit;
 
         bool marginCurrencyIs0 = currency0Address == position.marginCurrency
             ? true
@@ -580,17 +596,22 @@ contract PerpDexHook is BaseHook {
 
         // Longs logic for payouts
         if (position.isLong) {
-            uint256 priceShift = exitPrice - entryPrice;
-            profit = (priceShift * position.sizeUSD) / entryPrice;
+            int256 priceShift = exitPrice - entryPrice;
+            console.log("meow", priceShift);
+
+            profit = (priceShift * int256(position.sizeUSD)) / entryPrice;
+            console.log("meow", profit);
         } else {
-            uint256 priceShift = entryPrice - exitPrice;
-            profit = (priceShift * position.sizeUSD) / entryPrice;
+            int256 priceShift = entryPrice - exitPrice;
+            profit = (priceShift * int256(position.sizeUSD)) / entryPrice;
         }
+
+        console.log("meow");
 
         if (profit > 0) {
             // Add collateral back + increase collateral with profits. Also deduct trader payout from buffer.
             if (marginCurrencyIs0) {
-                uint256 currency0ToPayOut = profit / currency0Price;
+                uint256 currency0ToPayOut = uint256(profit / currency0Price);
 
                 require(
                     bufferCapitalCurrency0 > currency0ToPayOut,
@@ -603,7 +624,7 @@ contract PerpDexHook is BaseHook {
                     position.marginAmount +
                     currency0ToPayOut;
             } else {
-                uint256 currency1ToPayOut = profit / currency1Price;
+                uint256 currency1ToPayOut = uint256(profit / currency1Price);
 
                 require(
                     bufferCapitalCurrency1 > currency1ToPayOut,
@@ -617,11 +638,12 @@ contract PerpDexHook is BaseHook {
                     currency1ToPayOut;
             }
         }
+        console.log("meow1");
 
         if (profit < 0) {
             // Add back remaining collateral and add losses to pool fees.
             if (marginCurrencyIs0) {
-                uint256 currency0ToTakeOut = profit / currency0Price;
+                uint256 currency0ToTakeOut = uint256(-profit / currency0Price);
 
                 traderCollateral[msg.sender].currency0Amount +=
                     position.marginAmount -
@@ -629,7 +651,7 @@ contract PerpDexHook is BaseHook {
 
                 fees.traderPnLFeesCurrency0 += currency0ToTakeOut;
             } else {
-                uint256 currency1ToTakeOut = profit / currency1Price;
+                uint256 currency1ToTakeOut = uint256(-profit / currency1Price);
 
                 traderCollateral[msg.sender].currency1Amount +=
                     position.marginAmount -
@@ -638,6 +660,7 @@ contract PerpDexHook is BaseHook {
                 fees.traderPnLFeesCurrency1 += currency1ToTakeOut;
             }
         }
+        console.log("meow2");
 
         if (position.isLong) {
             longOpenInterest -= position.sizeUSD;
@@ -654,7 +677,7 @@ contract PerpDexHook is BaseHook {
             position.isLong,
             position.currencyBettingOn,
             position.entryPriceUSD,
-            exitPrice,
+            uint256(exitPrice),
             profit
         );
     }
@@ -814,6 +837,10 @@ contract PerpDexHook is BaseHook {
                     traderCollateral[trader].currency1Amount += reward1;
                 }
             }
+        } else {
+            // No counterparties, redirect all fees to LPs
+            fees.traderPnLFeesCurrency0 += totalFeesCurrency0;
+            fees.traderPnLFeesCurrency1 += totalFeesCurrency1;
         }
 
         lastFundingTime = block.timestamp;
@@ -834,9 +861,13 @@ contract PerpDexHook is BaseHook {
     ) public view returns (uint256, uint256, uint256) {
         uint256 currency0Price = getCurrentPrice(key, currency0Address);
         uint256 currency1Price = getCurrentPrice(key, currency1Address);
+        console.log("PASS 5", amountCurrency0, amountCurrency1);
+        console.log("PASS 5", currency0Price, currency1Price);
 
         uint256 currency0Value = currency0Price * amountCurrency0;
         uint256 currency1Value = currency1Price * amountCurrency1;
+
+        console.log("PASS 5");
 
         return (
             currency0Value,
@@ -860,22 +891,27 @@ contract PerpDexHook is BaseHook {
         }
 
         (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
-        uint256 poolPrice = (uint160(sqrtPriceX96) * uint160(sqrtPriceX96)) >>
+        console.log("PRICES:", uint256(sqrtPriceX96));
+
+        uint256 poolPrice = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >>
             192;
+
+        console.log("PRICES 2:", poolPrice);
+        console.log("PRICES 2:", uint256(chainlinkBasePrice), isBaseCurrency0);
 
         if (isBaseCurrency0) {
             // Chainlink base is currency0 (ETH)
             if (currencyAddress == currency1Address) {
                 // Pool is Base/Quote (ETH/PEPE), poolPrice = PEPE per ETH
                 // PEPE/USD = ETH/USD / (PEPE/ETH)
-                return (uint256(chainlinkBasePrice) * 1e18) / poolPrice;
+                return uint256(chainlinkBasePrice) / poolPrice;
             }
         } else {
             // Chainlink base is currency1 (PEPE)
             if (currencyAddress == currency0Address) {
                 // Pool is Quote/Base (PEPE/ETH), poolPrice = ETH per PEPE
                 // PEPE/USD = ETH/USD * (ETH/PEPE)
-                return (uint256(chainlinkBasePrice) * poolPrice) / 1e18;
+                return uint256(chainlinkBasePrice) * poolPrice;
             }
         }
 
@@ -933,12 +969,6 @@ contract PerpDexHook is BaseHook {
                 : shortOpenInterest - longOpenInterest;
     }
 
-    function getImbalanceRate() public view returns (uint256) {
-        return
-            (100 * (longOpenInterest - shortOpenInterest)) /
-            (longOpenInterest + shortOpenInterest);
-    }
-
     function validateFeed(address tokenAddress) internal view returns (bool) {
         try priceFeed.description() returns (string memory desc) {
             string memory tokenSymbol = IERC20Metadata(tokenAddress).symbol();
@@ -958,6 +988,17 @@ contract PerpDexHook is BaseHook {
         }
     }
 
+    function getPositionDetails(
+        address trader
+    ) public view returns (Position memory) {
+        Position memory position = livePositions[trader];
+        return position;
+    }
+
+    function getLPFeesDetails() public view returns (LPFees memory) {
+        return lpFees;
+    }
+
     event PositionOpened(
         address indexed trader,
         address marginCurrency,
@@ -974,7 +1015,7 @@ contract PerpDexHook is BaseHook {
         address currencyBettingOn,
         uint256 entryPrice,
         uint256 exitPrice,
-        uint256 profit
+        int256 profit
     );
     event PositionLiquidated(
         address indexed trader,
