@@ -575,6 +575,8 @@ contract PerpDexHook is BaseHook {
             timestamp: block.timestamp
         });
 
+        activeTraders.push(msg.sender);
+
         if (isLong) {
             longOpenInterest += positionSize;
         } else {
@@ -676,6 +678,7 @@ contract PerpDexHook is BaseHook {
         lockedUSDForCollateral -= position.sizeUSD;
 
         delete livePositions[msg.sender];
+        removeTrader(msg.sender);
 
         emit PositionClosed(
             msg.sender,
@@ -798,6 +801,7 @@ contract PerpDexHook is BaseHook {
                         liquidatePosition(trader, key);
                         continue;
                     }
+
                     traderCollateral[trader].currency0Amount -= feeInToken;
                     totalFeesCurrency0 += feeInToken;
                 } else {
@@ -806,6 +810,7 @@ contract PerpDexHook is BaseHook {
                         liquidatePosition(trader, key);
                         continue;
                     }
+
                     traderCollateral[trader].currency1Amount -= feeInToken;
                     totalFeesCurrency1 += feeInToken;
                 }
@@ -824,6 +829,7 @@ contract PerpDexHook is BaseHook {
         uint256 receivingSideInterest = longsPayShorts
             ? shortOpenInterest
             : longOpenInterest;
+
         if (receivingSideInterest > 0) {
             for (uint i = 0; i < activeTraders.length; i++) {
                 address trader = activeTraders[i];

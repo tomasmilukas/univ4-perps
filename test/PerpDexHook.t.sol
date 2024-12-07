@@ -405,6 +405,84 @@ contract PerpDexHookTest is Test, Deployers {
         vm.stopPrank();
     }
 
+    // This test showcases how payments are made between longs and shorts
+    function test_fundingPaymentsBetweenTraders() public {
+        uint256 marginAmount = 1e18;
+        uint256 leverage = 2;
+        bool isLong = true;
+        address currencyBettingOn = address(token0);
+        address marginCurrency = address(token0);
+
+        // open a short as trader2
+        vm.startPrank(trader2);
+        token0.approve(address(hook), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            (9 * marginAmount) / 10, // commit 90% to have collateral for funding payments
+            marginCurrency,
+            leverage,
+            false
+        );
+        vm.stopPrank();
+
+        // Open a long as trader1
+        vm.startPrank(trader1);
+        token0.approve(address(hook), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount / 2, // half the position size to create imbalance
+            marginCurrency,
+            leverage,
+            isLong
+        );
+
+        int256 newPrice = (1010 * INITIAL_PRICE) / 1000; // Price increases by 1%
+        mockFeed.setLatestAnswer(newPrice);
+
+        vm.stopPrank();
+
+        (, , uint256 currency0AmountPreFundingT2, ) = hook.traderCollateral(
+            trader2
+        );
+        (, , uint256 currency0AmountPreFundingT1, ) = hook.traderCollateral(
+            trader1
+        );
+
+        // warp for funding payments
+        vm.warp(block.timestamp + 8 hours);
+
+        vm.startPrank(operator);
+        hook.distributeFunding(key);
+
+        (, , uint256 currency0AmountPostFundingT2, ) = hook.traderCollateral(
+            trader2
+        );
+        (, , uint256 currency0AmountPostFundingT1, ) = hook.traderCollateral(
+            trader1
+        );
+
+        assertTrue(
+            currency0AmountPostFundingT2 < currency0AmountPreFundingT2,
+            "Trader 2 had to pay funding"
+        );
+        assertTrue(
+            currency0AmountPostFundingT1 > currency0AmountPreFundingT1,
+            "Trader 1 had to receive funding"
+        );
+    }
+
+    // // This test showcases traders being liquidated due to price movement
+    // function test_liquidateTrader() public {}
+
+    // // This test showcases how traders keeping realised profits locks up LPers
+    // function test_tradersKeepingRealisedProfits() public {}
+
     // HELPERS
 
     function calculateLiquidity(
@@ -429,13 +507,3 @@ contract PerpDexHookTest is Test, Deployers {
         );
     }
 }
-
-/*
-
-3. funding payments between longs and shorts + liquidate if margin depleted
-4. dynamic fees for utilization, imbalnance, etc
-6. simulate pool prices going up or down and positions surviving
-8. showcase realised profits are locked in some fashion
-9. show traders can withdraw profit successfully
-
-*/
