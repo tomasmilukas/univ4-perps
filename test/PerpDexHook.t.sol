@@ -369,11 +369,8 @@ contract PerpDexHookTest is Test, Deployers {
 
 3. funding payments between longs and shorts + liquidate if margin depleted
 4. dynamic fees for utilization, imbalnance, etc
-5. LPs earning fees in the mean time
 6. simulate pool prices going up or down and positions surviving
-7. simulate pool value USD going up or down in eth/uni example to showcase its in USD
 8. showcase realised profits are locked in some fashion
 9. show traders can withdraw profit successfully
-10. show LPs cant withdraw when locked, then show traders closign and LPs being able to withdraw
 
 */
