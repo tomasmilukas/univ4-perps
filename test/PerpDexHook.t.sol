@@ -16,6 +16,7 @@ import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
 import {MockPriceFeed} from "./mocks/MockPriceFeed.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
+import {LiquidityAmounts} from "lib/v4-periphery/lib/v4-core/test/utils/LiquidityAmounts.sol";
 
 import "forge-std/console.sol";
 
@@ -28,12 +29,16 @@ contract PerpDexHookTest is Test, Deployers {
     address public operator;
     address public mockPriceFeed;
 
-    uint256 constant LP1_AMOUNT = 1000 ether;
+    uint256 constant LP1_AMOUNT = 2e18;
     int256 constant INITIAL_PRICE = 1000e18; // $1000 base price
+    int24 constant STARTING_TICK = 0;
 
     // Test accounts
     address lp1 = makeAddr("lp1");
     address lp2 = makeAddr("lp2");
+
+    address trader1 = makeAddr("trader1");
+    address trader2 = makeAddr("trader2");
 
     function setUp() public {
         deployFreshManagerAndRouters();
@@ -41,6 +46,7 @@ contract PerpDexHookTest is Test, Deployers {
             Currency _token0,
             Currency _token1
         ) = deployMintAndApprove2Currencies();
+
         token0 = MockERC20(Currency.unwrap(_token0));
         token1 = MockERC20(Currency.unwrap(_token1));
 
@@ -58,7 +64,8 @@ contract PerpDexHookTest is Test, Deployers {
                     Hooks.AFTER_ADD_LIQUIDITY_FLAG |
                     Hooks.BEFORE_REMOVE_LIQUIDITY_FLAG |
                     Hooks.AFTER_REMOVE_LIQUIDITY_FLAG |
-                    Hooks.AFTER_SWAP_FLAG
+                    Hooks.AFTER_SWAP_FLAG |
+                    Hooks.AFTER_ADD_LIQUIDITY_RETURNS_DELTA_FLAG
             )
         );
 
@@ -74,7 +81,13 @@ contract PerpDexHookTest is Test, Deployers {
         token1.approve(address(hook), type(uint256).max);
 
         // Initialize pool
-        (key, ) = initPool(_token0, _token1, hook, 3000, SQRT_PRICE_1_1);
+        (key, ) = initPool(
+            _token0,
+            _token1,
+            hook,
+            3000,
+            TickMath.getSqrtPriceAtTick(STARTING_TICK)
+        );
 
         // Deal LP1 tokens
         deal(address(token0), lp1, LP1_AMOUNT);
@@ -86,66 +99,30 @@ contract PerpDexHookTest is Test, Deployers {
         token0.approve(address(modifyLiquidityRouter), LP1_AMOUNT);
         token1.approve(address(modifyLiquidityRouter), LP1_AMOUNT);
 
-        IPoolManager.ModifyLiquidityParams memory params = IPoolManager
-            .ModifyLiquidityParams({
-                tickLower: -60,
-                tickUpper: 60,
-                liquidityDelta: int256(LP1_AMOUNT),
-                salt: bytes32(0)
-            });
-
-        modifyLiquidityRouter.modifyLiquidity(key, params, ZERO_BYTES);
-
-        // // Add liquidity using the router
-        // IPoolManager.ModifyLiquidityParams memory params = IPoolManager
-        //     .ModifyLiquidityParams({
-        //         tickLower: -60,
-        //         tickUpper: 60,
-        //         liquidityDelta: int256(LP1_AMOUNT), // Add liquidity
-        //         salt: bytes32(0)
-        //     });
-
-        // modifyLiquidityRouter.modifyLiquidity(key, params, ZERO_BYTES);
-
-        vm.stopPrank();
-    }
-
-    function test_afterAddLiquidity_simple() public {
-        uint256 liquidityAmountToken0 = 1e18; 
-        address lp = lp1;
-
-        deal(address(token0), lp, liquidityAmountToken0);
-        vm.startPrank(lp);
-        token0.approve(address(modifyLiquidityRouter), liquidityAmountToken0);
-
-        uint256 initialBufferCapital0 = hook.bufferCapitalCurrency0();
-        uint256 initialHookBalanceToken0 = token0.balanceOf(address(hook));
+        int256 liquidityDelta = int128(
+            calculateLiquidity(STARTING_TICK, -60, 60, LP1_AMOUNT, LP1_AMOUNT)
+        );
 
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager
             .ModifyLiquidityParams({
                 tickLower: -60,
                 tickUpper: 60,
-                liquidityDelta: int256(liquidityAmountToken0),
+                liquidityDelta: liquidityDelta,
                 salt: bytes32(0)
             });
+
         modifyLiquidityRouter.modifyLiquidity(key, params, ZERO_BYTES);
 
-        uint256 updatedBufferCapital0 = hook.bufferCapitalCurrency0();
-        uint256 updatedHookBalanceToken0 = token0.balanceOf(address(hook));
-
-        assertTrue(
-            updatedBufferCapital0 > initialBufferCapital0,
-            "Buffer capital mismatch"
-        );
-
-        assertTrue(
-            updatedHookBalanceToken0 > initialHookBalanceToken0,
-            "Hook token balance mismatch"
-        );
-
         vm.stopPrank();
+
+        // deal tokens for others
+        deal(address(token0), trader1, 100e18);
+        deal(address(token1), trader1, 100e18);
+        deal(address(token0), trader2, 100e18);
+        deal(address(token1), trader2, 100e18);
     }
 
+    // Open positions, locks collateral and LP cant withdraw since he is alone in the pool
     function test_openPosition() public {
         uint256 marginAmount = 1e18;
         uint256 leverage = 2;
@@ -158,7 +135,7 @@ contract PerpDexHookTest is Test, Deployers {
         uint256 initialLockedUSD = hook.lockedUSDForCollateral();
 
         // Add collateral to the trader
-        vm.prank(lp1);
+        vm.prank(trader1);
         token0.transfer(address(this), marginAmount);
         hook.addCollateral(marginAmount, 0);
 
@@ -176,7 +153,11 @@ contract PerpDexHookTest is Test, Deployers {
         );
 
         assertEq(position.trader, address(this), "Trader address mismatch");
-        assertEq(position.marginAmount, marginAmount, "Margin amount mismatch");
+        assertEq(
+            position.marginAmount,
+            marginAmount - marginAmount / 10000, // opening fee is 0.01%
+            "Margin amount mismatch"
+        );
         assertEq(position.leverage, leverage, "Leverage mismatch");
         assertEq(position.isLong, isLong, "Position type mismatch");
         assertEq(
@@ -211,10 +192,36 @@ contract PerpDexHookTest is Test, Deployers {
             "Trader's token0 collateral mismatch"
         );
         assertEq(currency0Amount, 0, "Trader's token0 collateral mismatch");
+
+        // Attempt to withdraw liquidity as LP and expect a revert
+        vm.startPrank(lp1);
+
+        IPoolManager.ModifyLiquidityParams memory removeParams = IPoolManager
+            .ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -int256(
+                    int128(
+                        calculateLiquidity(
+                            STARTING_TICK,
+                            -60,
+                            60,
+                            LP1_AMOUNT,
+                            LP1_AMOUNT
+                        )
+                    )
+                ), // Remove all liquidity
+                salt: bytes32(0)
+            });
+
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(key, removeParams, ZERO_BYTES);
+
+        vm.stopPrank();
     }
 
     // This test showcases openPosition + closePosition, but price moved down and LPs got the margin profit from trader. LP also withdraws and takes profit.
-    function test_priceDecreaseAndCollateralLoss() public {
+    function test_priceDecreaseAndCollateralLossWithLPWithdrawal() public {
         uint256 marginAmount = 1e18;
         uint256 leverage = 2;
         bool isLong = true;
@@ -228,8 +235,8 @@ contract PerpDexHookTest is Test, Deployers {
             .traderPnLFeesCurrency0;
 
         // Add collateral to the trader
-        vm.prank(lp1);
-        token0.transfer(address(this), marginAmount);
+        vm.startPrank(trader1);
+        token0.approve(address(hook), marginAmount);
         hook.addCollateral(marginAmount, 0);
 
         // Open the position
@@ -246,15 +253,11 @@ contract PerpDexHookTest is Test, Deployers {
         int256 newPrice = (7 * INITIAL_PRICE) / 10; // Price decreases by 30%
         mockFeed.setLatestAnswer(newPrice);
 
-        // Fetch the position details before closing
-        PerpDexHook.Position memory positionBeforeClose = hook
-            .getPositionDetails(address(this));
-
         // Close the position
-        hook.closePosition(address(this), key);
+        hook.closePosition(key);
 
         // Fetch trader collateral after position close
-        (, , uint256 currency0Amount, ) = hook.traderCollateral(address(this));
+        (, , uint256 currency0Amount, ) = hook.traderCollateral(trader1);
 
         // Updated metrics
         uint256 updatedLockedUSD = hook.lockedUSDForCollateral();
@@ -265,7 +268,7 @@ contract PerpDexHookTest is Test, Deployers {
         // Assertions
         // Verify trader collateral has decreased
         assertTrue(
-            currency0Amount < positionBeforeClose.marginAmount,
+            currency0Amount < marginAmount,
             "Trader's collateral should decrease due to loss"
         );
         assertTrue(
@@ -283,6 +286,81 @@ contract PerpDexHookTest is Test, Deployers {
         assertTrue(
             updatedLockedUSD == initialLockedUSD,
             "Nothing should be locked"
+        );
+
+        // Remove collateral so LP can withdraw profits
+        hook.removeCollateral();
+        vm.stopPrank();
+
+        vm.startPrank(address(hook));
+        token0.approve(address(manager), type(uint256).max);
+        token1.approve(address(manager), type(uint256).max);
+
+        token0.allowance(address(hook), address(manager));
+        token1.allowance(address(hook), address(manager));
+        vm.stopPrank();
+
+        vm.startPrank(lp1);
+
+        console.log(
+            "Allowance for manager (token0):",
+            token0.allowance(address(hook), address(manager))
+        );
+        console.log(
+            "Allowance for manager (token1):",
+            token1.allowance(address(hook), address(manager))
+        );
+
+        IPoolManager.ModifyLiquidityParams memory params = IPoolManager
+            .ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -int256(
+                    int128(
+                        calculateLiquidity(
+                            STARTING_TICK,
+                            -60,
+                            60,
+                            LP1_AMOUNT,
+                            LP1_AMOUNT
+                        )
+                    )
+                ), // Remove all liquidity
+                salt: bytes32(0)
+            });
+
+        modifyLiquidityRouter.modifyLiquidity(key, params, abi.encode(lp1));
+
+        vm.stopPrank();
+
+        // Verify LP profits exceed their initial deposit amount
+        assertTrue(
+            token0.balanceOf(lp1) - LP1_AMOUNT > 0,
+            "LP profit in token0 should exceed initial deposit"
+        );
+    }
+
+    // HELPERS
+
+    function calculateLiquidity(
+        int24 currentTick,
+        int24 tickLower,
+        int24 tickUpper,
+        uint256 amount0Desired,
+        uint256 amount1Desired
+    ) internal pure returns (uint128 liquidity) {
+        // Compute sqrt price of lower and upper ticks
+        uint160 sqrtPriceCurrentX96 = TickMath.getSqrtPriceAtTick(currentTick);
+        uint160 sqrtPriceLowerX96 = TickMath.getSqrtPriceAtTick(tickLower);
+        uint160 sqrtPriceUpperX96 = TickMath.getSqrtPriceAtTick(tickUpper);
+
+        // Calculate liquidity using the Uniswap V3 formula
+        liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceCurrentX96,
+            sqrtPriceLowerX96,
+            sqrtPriceUpperX96,
+            amount0Desired,
+            amount1Desired
         );
     }
 }
