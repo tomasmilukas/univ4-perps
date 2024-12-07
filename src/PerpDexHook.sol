@@ -274,18 +274,9 @@ contract PerpDexHook is BaseHook {
             fees.traderPnLFeesCurrency1 +
             fees.tradingFeesCurrency1;
 
-        console.log(
-            "MEOW",
-            IERC20Metadata(currency0Address).balanceOf(address(this))
-        );
-
         if (
             (totalFees0 * share.token0Deposited) / totalCurrency0Deposited > 0
         ) {
-            console.log(
-                "DIVISION HOW MUCH TO TRANSFER:",
-                (totalFees0 * share.token0Deposited) / totalCurrency0Deposited
-            );
             IERC20Metadata(currency0Address).transfer(
                 abi.decode(data, (address)),
                 ((totalFees0 * share.token0Deposited) / totalCurrency0Deposited)
@@ -638,7 +629,7 @@ contract PerpDexHook is BaseHook {
             profit = (priceShift * int256(position.sizeUSD)) / entryPrice;
         }
 
-        if (profit > 0) {
+        if (profit >= 0) {
             // Add collateral back + increase collateral with profits. Also deduct trader payout from buffer.
             if (marginCurrencyIs0) {
                 uint256 currency0ToPayOut = uint256(profit / currency0Price);

@@ -221,7 +221,7 @@ contract PerpDexHookTest is Test, Deployers {
     }
 
     // This test showcases openPosition + closePosition, but price moved down and LPs got the margin profit from trader. LP also withdraws and takes profit.
-    function test_priceDecreaseAndCollateralLossWithLPWithdrawal() public {
+    function test_priceDecreaseAndCollateralLoss() public {
         uint256 marginAmount = 1e18;
         uint256 leverage = 2;
         bool isLong = true;
@@ -302,15 +302,6 @@ contract PerpDexHookTest is Test, Deployers {
 
         vm.startPrank(lp1);
 
-        console.log(
-            "Allowance for manager (token0):",
-            token0.allowance(address(hook), address(manager))
-        );
-        console.log(
-            "Allowance for manager (token1):",
-            token1.allowance(address(hook), address(manager))
-        );
-
         IPoolManager.ModifyLiquidityParams memory params = IPoolManager
             .ModifyLiquidityParams({
                 tickLower: -60,
@@ -338,6 +329,80 @@ contract PerpDexHookTest is Test, Deployers {
             token0.balanceOf(lp1) - LP1_AMOUNT > 0,
             "LP profit in token0 should exceed initial deposit"
         );
+    }
+
+    // This test showcases the same as the one above but the price moved up and the trader profited and took out the profits from LPs fees.
+    // If fees didnt exist, in this design trader has to wait for fees, but i initially planned to create buffer capital which will be implemented post hookathon.
+    function test_priceIncreaseAndTraderProfits() public {
+        uint256 marginAmount = 1e18;
+        uint256 leverage = 2;
+        bool isLong = true;
+        address currencyBettingOn = address(token0);
+        address marginCurrency = address(token0);
+
+        // Open and close trades from trader2 to generate fees for trader1 profitable trade.
+        // This is only being done because i didnt implement buffer capital bcos of afterAddLiquidityReturnDelta struggle.
+        vm.startPrank(trader2);
+        token0.approve(address(hook), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount,
+            marginCurrency,
+            leverage,
+            isLong
+        );
+        hook.closePosition(key);
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount / 2,
+            marginCurrency,
+            leverage,
+            isLong
+        );
+        hook.closePosition(key);
+        vm.stopPrank();
+
+        // Trader 1 will be profitable so this where the real test begins
+        vm.startPrank(trader1);
+        token0.approve(address(hook), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        // Open the position
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount,
+            marginCurrency,
+            leverage,
+            isLong
+        );
+
+        int256 newPrice = (1001 * INITIAL_PRICE) / 1000; // Price increases by 0.1%
+        mockFeed.setLatestAnswer(newPrice);
+
+        // Close the position
+        hook.closePosition(key);
+
+        // Fetch trader collateral after position close
+        (, , uint256 currency0Amount, ) = hook.traderCollateral(trader1);
+
+        assertTrue(
+            currency0Amount > marginAmount,
+            "Trader's collateral increased since they started"
+        );
+
+        hook.removeCollateral();
+
+        assertTrue(
+            token0.balanceOf(trader2) > marginAmount,
+            "Trader withdrew profits successfully, profiting from LP fees"
+        );
+
+        vm.stopPrank();
     }
 
     // HELPERS
