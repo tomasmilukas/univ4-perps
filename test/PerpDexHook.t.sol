@@ -120,6 +120,8 @@ contract PerpDexHookTest is Test, Deployers {
         deal(address(token1), trader1, 100e18);
         deal(address(token0), trader2, 100e18);
         deal(address(token1), trader2, 100e18);
+        deal(address(token0), lp2, 100e18);
+        deal(address(token1), lp2, 100e18);
     }
 
     // Open positions, locks collateral and LP cant withdraw since he is alone in the pool
@@ -522,8 +524,128 @@ contract PerpDexHookTest is Test, Deployers {
         );
     }
 
-    // This test showcases how traders keeping realised profits locks up LPers
-    function test_tradersKeepingRealisedProfits() public {}
+    // This test showcases how traders keeping realised profits locks up LPers. However, LP2 joining in will bump up capital enough to free up LP1
+    function test_tradersKeepingRealisedProfits() public {
+        uint256 marginAmount = 1e18;
+        uint256 leverage = 2;
+        bool isLong = true;
+        address currencyBettingOn = address(token0);
+        address marginCurrency = address(token0);
+
+        // Add collateral to the trader
+        vm.prank(trader1);
+        token0.transfer(address(this), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        // Open the position
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount,
+            marginCurrency,
+            leverage,
+            isLong
+        );
+
+        int256 newPrice = (105 * INITIAL_PRICE) / 100; // Price increases by 5%
+        mockFeed.setLatestAnswer(newPrice);
+
+        // Close the position
+        hook.closePosition(key);
+
+        // Attempt to withdraw liquidity as LP and expect a revert
+        vm.startPrank(lp1);
+
+        IPoolManager.ModifyLiquidityParams memory removeParams = IPoolManager
+            .ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -int256(
+                    int128(
+                        calculateLiquidity(
+                            STARTING_TICK,
+                            -60,
+                            60,
+                            LP1_AMOUNT,
+                            LP1_AMOUNT
+                        )
+                    )
+                ), // Remove all liquidity
+                salt: bytes32(0)
+            });
+
+        vm.expectRevert();
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            removeParams,
+            abi.encode(lp1)
+        );
+
+        vm.stopPrank();
+
+        // Add capital as LP2 to free up LP1
+        vm.startPrank(lp2);
+        token0.approve(address(modifyLiquidityRouter), LP1_AMOUNT);
+        token1.approve(address(modifyLiquidityRouter), LP1_AMOUNT);
+
+        IPoolManager.ModifyLiquidityParams memory addParams = IPoolManager
+            .ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: int256(
+                    int128(
+                        calculateLiquidity(
+                            STARTING_TICK,
+                            -60,
+                            60,
+                            LP1_AMOUNT,
+                            LP1_AMOUNT
+                        )
+                    )
+                ), 
+                salt: bytes32(0)
+            });
+
+        modifyLiquidityRouter.modifyLiquidity(key, addParams, ZERO_BYTES);
+
+        vm.stopPrank();
+
+        // WITHDRAW SUCCESSFULY AS LP1
+        vm.startPrank(lp1);
+
+        uint256 balancePreRemoval = token0.balanceOf(lp1);
+
+        IPoolManager.ModifyLiquidityParams memory removeParamsSuccess = IPoolManager
+            .ModifyLiquidityParams({
+                tickLower: -60,
+                tickUpper: 60,
+                liquidityDelta: -int256(
+                    int128(
+                        calculateLiquidity(
+                            STARTING_TICK,
+                            -60,
+                            60,
+                            LP1_AMOUNT,
+                            LP1_AMOUNT
+                        )
+                    )
+                ), // Remove all liquidity
+                salt: bytes32(0)
+            });
+
+        modifyLiquidityRouter.modifyLiquidity(
+            key,
+            removeParamsSuccess,
+            abi.encode(lp1)
+        );
+
+        uint256 balancePostRemoval = token0.balanceOf(lp1);
+
+        assertTrue(
+            balancePostRemoval > balancePreRemoval,
+            "LP withdrew capital successfully"
+        );
+    }
 
     // HELPERS
 

@@ -18,9 +18,6 @@ import {LiquidityAmounts} from "lib/v4-periphery/lib/v4-core/test/utils/Liquidit
 
 import "solidity-stringutils/src/strings.sol";
 
-// REMOVE BEFORE SUBMISSION
-import "forge-std/console.sol";
-
 contract PerpDexHook is BaseHook {
     using strings for *;
     using StateLibrary for IPoolManager;
@@ -109,6 +106,10 @@ contract PerpDexHook is BaseHook {
     // OI recorded in USD
     uint256 public longOpenInterest;
     uint256 public shortOpenInterest;
+
+    // traders total realized profits
+    uint256 public totalRealizedProfitsCurrency0;
+    uint256 public totalRealizedProfitsCurrency1;
 
     // Was planning to implement buffer capital but didnt figure out the afterAddLiquidity delta on time, will do it after hookathon.
     // // LPs set aside 10% of their position as buffer capital for trader payouts so we avoid rebalancing LP positions
@@ -208,14 +209,14 @@ contract PerpDexHook is BaseHook {
                 uint128(int128(params.liquidityDelta))
             );
 
-        totalCurrency0Deposited += uint128(amount0);
-        totalCurrency1Deposited += uint128(amount1);
+        totalCurrency0Deposited += amount0;
+        totalCurrency1Deposited += amount1;
 
-        shares[sender].token0Deposited = uint128(amount0);
-        shares[sender].token1Deposited = uint128(amount1);
+        shares[sender].token0Deposited = amount0;
+        shares[sender].token1Deposited = amount1;
 
-        underlyingLiquidityAmountCurrency0 += uint128(amount0);
-        underlyingLiquidityAmountCurrency1 += uint128(amount1);
+        underlyingLiquidityAmountCurrency0 += amount0;
+        underlyingLiquidityAmountCurrency1 += amount1;
 
         return (this.afterAddLiquidity.selector, toBalanceDelta(0, 0));
     }
@@ -246,12 +247,22 @@ contract PerpDexHook is BaseHook {
         uint256 currPrice0 = getCurrentPrice(key, currency0Address);
         uint256 currPrice1 = getCurrentPrice(key, currency1Address);
 
+        uint256 totalLockedProfitsUSD = totalRealizedProfitsCurrency0 *
+            currPrice0 +
+            totalRealizedProfitsCurrency1 *
+            currPrice1;
+
         require(
-            lockedUSDForCollateral + getNetOIExposure() <=
+            lockedUSDForCollateral +
+                getNetOIExposure() +
+                totalLockedProfitsUSD <=
                 totalPoolValueUSD -
                     (currPrice0 * amount0 + currPrice1 * amount1),
             "All liquidity is locked, must wait for traders to close positions or other LPers to join."
         );
+
+        underlyingLiquidityAmountCurrency0 -= amount0;
+        underlyingLiquidityAmountCurrency1 -= amount1;
 
         return this.beforeRemoveLiquidity.selector;
     }
@@ -301,6 +312,7 @@ contract PerpDexHook is BaseHook {
             fees.leverageFeesCurrency1 -
             ((fees.leverageFeesCurrency1 * share.token1Deposited) /
                 totalCurrency1Deposited);
+
         fees.traderPnLFeesCurrency0 =
             fees.traderPnLFeesCurrency0 -
             ((fees.traderPnLFeesCurrency0 * share.token0Deposited) /
@@ -309,6 +321,7 @@ contract PerpDexHook is BaseHook {
             fees.traderPnLFeesCurrency1 -
             ((fees.traderPnLFeesCurrency1 * share.token1Deposited) /
                 totalCurrency1Deposited);
+
         fees.tradingFeesCurrency0 =
             fees.tradingFeesCurrency0 -
             ((fees.tradingFeesCurrency0 * share.token0Deposited) /
@@ -415,13 +428,6 @@ contract PerpDexHook is BaseHook {
             fees.leverageFeesCurrency0 +
             fees.tradingFeesCurrency0;
 
-        console.log(
-            "REMOVE COLLATERAL INFO:",
-            totalPayoutCapitalCurrency0,
-            IERC20Metadata(currency0Address).balanceOf(address(this)),
-            collateral.currency0Amount
-        );
-
         require(
             collateral.currency0Amount <
                 totalPayoutCapitalCurrency0 +
@@ -433,6 +439,8 @@ contract PerpDexHook is BaseHook {
             collateral.fundedAmountCurrency0;
 
         if (traderProfit0 > 0) {
+            totalRealizedProfitsCurrency0 -= traderProfit0;
+
             if (traderProfit0 > fees.traderPnLFeesCurrency0) {
                 fees.traderPnLFeesCurrency0 = 0;
                 traderProfit0 -= fees.traderPnLFeesCurrency0;
@@ -469,6 +477,8 @@ contract PerpDexHook is BaseHook {
             collateral.fundedAmountCurrency1;
 
         if (traderProfit1 > 0) {
+            totalRealizedProfitsCurrency1 -= traderProfit1;
+
             if (traderProfit1 > fees.traderPnLFeesCurrency1) {
                 fees.traderPnLFeesCurrency1 = 0;
                 traderProfit1 -= fees.traderPnLFeesCurrency1;
@@ -632,15 +642,19 @@ contract PerpDexHook is BaseHook {
         }
 
         if (profit >= 0) {
-            // Add collateral back + increase collateral with profits. Also deduct trader payout from buffer.
+            // Add collateral back + increase collateral with profits.
             if (marginCurrencyIs0) {
                 uint256 currency0ToPayOut = uint256(profit / currency0Price);
+
+                totalRealizedProfitsCurrency0 += currency0ToPayOut;
 
                 traderCollateral[msg.sender].currency0Amount +=
                     position.marginAmount +
                     currency0ToPayOut;
             } else {
                 uint256 currency1ToPayOut = uint256(profit / currency1Price);
+
+                totalRealizedProfitsCurrency1 += currency1ToPayOut;
 
                 traderCollateral[msg.sender].currency1Amount +=
                     position.marginAmount +
@@ -653,6 +667,15 @@ contract PerpDexHook is BaseHook {
             if (marginCurrencyIs0) {
                 uint256 currency0ToTakeOut = uint256(-profit / currency0Price);
 
+                // If trader still retains profit after losing trade, reduce global realized profits. We cant do this blindly because it results in neutral offsets meaning LPs can rug traders
+                if (
+                    traderCollateral[msg.sender].currency0Amount +
+                        currency0ToTakeOut >=
+                    traderCollateral[msg.sender].fundedAmountCurrency0
+                ) {
+                    totalRealizedProfitsCurrency0 -= currency0ToTakeOut;
+                }
+
                 traderCollateral[msg.sender].currency0Amount +=
                     position.marginAmount -
                     currency0ToTakeOut;
@@ -660,6 +683,15 @@ contract PerpDexHook is BaseHook {
                 fees.traderPnLFeesCurrency0 += currency0ToTakeOut;
             } else {
                 uint256 currency1ToTakeOut = uint256(-profit / currency1Price);
+
+                // If trader still retains profit after losing trade, reduce global realized profits. We cant do this blindly because it results in neutral offsets meaning LPs can rug traders
+                if (
+                    traderCollateral[msg.sender].currency1Amount +
+                        currency1ToTakeOut >=
+                    traderCollateral[msg.sender].fundedAmountCurrency1
+                ) {
+                    totalRealizedProfitsCurrency1 -= currency1ToTakeOut;
+                }
 
                 traderCollateral[msg.sender].currency1Amount +=
                     position.marginAmount -
