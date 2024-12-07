@@ -477,11 +477,53 @@ contract PerpDexHookTest is Test, Deployers {
         );
     }
 
-    // // This test showcases traders being liquidated due to price movement
-    // function test_liquidateTrader() public {}
+    // This test showcases traders being liquidated due to price movement
+    function test_liquidateTrader() public {
+        uint256 marginAmount = 1e18;
+        uint256 leverage = 2;
+        bool isLong = true;
+        address currencyBettingOn = address(token0);
+        address marginCurrency = address(token0);
 
-    // // This test showcases how traders keeping realised profits locks up LPers
-    // function test_tradersKeepingRealisedProfits() public {}
+        // Open a long as trader1
+        vm.startPrank(trader1);
+        token0.approve(address(hook), marginAmount);
+        hook.addCollateral(marginAmount, 0);
+
+        hook.openPosition(
+            key,
+            currencyBettingOn,
+            marginAmount,
+            marginCurrency,
+            leverage,
+            isLong
+        );
+
+        int256 newPrice = INITIAL_PRICE / 10; // Price decreasess by 90%
+        mockFeed.setLatestAnswer(newPrice);
+        vm.stopPrank();
+
+        vm.startPrank(operator);
+        hook.liquidatePosition(trader1, key);
+
+        PerpDexHook.Position memory position = hook.getPositionDetails(trader1);
+        PerpDexHook.LPFees memory lpFees = hook.getLPFeesDetails();
+
+        assertTrue(
+            position.trader == address(0),
+            "liquidiated, position doesnt exist anymore"
+        );
+        assertTrue(
+            lpFees.leverageFeesCurrency0 +
+                lpFees.traderPnLFeesCurrency0 +
+                lpFees.tradingFeesCurrency0 ==
+                marginAmount,
+            "full margin is spread accross LP fees"
+        );
+    }
+
+    // This test showcases how traders keeping realised profits locks up LPers
+    function test_tradersKeepingRealisedProfits() public {}
 
     // HELPERS
 
